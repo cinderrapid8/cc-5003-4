@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>博物馆语音讲解 · 响度制作服务</title>
+<style>
+  :root { --bg:#f5f4f0; --card:#fff; --line:#d9d5cc; --ink:#232018; --accent:#7a5c2e; --warn:#9a3b1f; --ok:#2e6b3f; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.55 "PingFang SC","Microsoft YaHei",system-ui,sans-serif; background:var(--bg); color:var(--ink); }
+  header { background:#2b2620; color:#f0e9db; padding:16px 24px; }
+  header h1 { margin:0; font-size:18px; font-weight:600; }
+  header p { margin:4px 0 0; font-size:12px; color:#b9ad97; }
+  main { max-width:1180px; margin:0 auto; padding:20px; display:grid; gap:18px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 18px; }
+  .card h2 { margin:0 0 12px; font-size:15px; color:var(--accent); }
+  .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
+  button { border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:6px; padding:7px 14px; cursor:pointer; font-size:13px; }
+  button.secondary { background:#fff; color:var(--accent); }
+  button.danger { border-color:var(--warn); background:var(--warn); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  input,select { border:1px solid var(--line); border-radius:6px; padding:6px 8px; font-size:13px; background:#fff; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th,td { border-bottom:1px solid var(--line); padding:7px 8px; text-align:left; vertical-align:top; }
+  th { color:#6b6252; font-weight:600; background:#faf8f3; position:sticky; top:0; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11.5px; }
+  .pill.queued,.pill.analyzing,.pill.processing { background:#e8e0cf; color:#6b5a2e; }
+  .pill.analyzed { background:#dde7ee; color:#2f4b63; }
+  .pill.succeeded,.pill.matched { background:#dcebe0; color:var(--ok); }
+  .pill.limited { background:#f3e6cf; color:#8a611c; }
+  .pill.target_missed,.pill.failed,.pill.rejected { background:#f4dcd6; color:var(--warn); }
+  .pill.cancelled { background:#e3e0da; color:#555; }
+  .warn { color:var(--warn); font-weight:600; }
+  .muted { color:#867d6d; }
+  audio { height:34px; width:230px; }
+  .targets label { display:flex; flex-direction:column; gap:3px; font-size:12px; color:#6b6252; }
+  .unmet { background:#fbf0ec; border-left:3px solid var(--warn); padding:8px 10px; border-radius:4px; margin-top:8px; font-size:12.5px; }
+  .chain { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11.5px; white-space:pre-wrap; background:#faf8f3; border:1px solid var(--line); border-radius:6px; padding:10px; max-height:340px; overflow:auto; }
+  .toast { position:fixed; bottom:18px; right:18px; background:#2b2620; color:#f0e9db; padding:10px 16px; border-radius:8px; font-size:13px; opacity:0; transition:opacity .25s; }
+  .toast.show { opacity:1; }
+  details summary { cursor:pointer; color:var(--accent); font-size:12.5px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  @media (max-width:860px){ .grid2{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<header>
+  <h1>博物馆语音讲解 · 响度制作服务</h1>
+  <p id="prov">读取运行版本中…</p>
+</header>
+<main>
+  <section class="card">
+    <h2>1 · 上传多段测试讲解（WAV：PCM 16/24/32-bit 或 32-bit float）</h2>
+    <div class="row">
+      <input type="file" id="files" accept=".wav,audio/wav" multiple>
+      <button id="uploadBtn">上传并分析</button>
+      <span class="muted" id="uploadHint"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>2 · 分析结果与任务</h2>
+    <div style="overflow:auto; max-height:520px;">
+      <table id="taskTable">
+        <thead><tr>
+          <th>文件 / 任务</th><th>状态</th><th>时长</th><th>声道</th>
+          <th>综合响度 LUFS</th><th>LRA LU</th><th>样本峰值 dBFS</th><th>真峰值 dBTP</th>
+          <th>RMS dBFS</th><th>门限块</th><th>提示</th><th>操作</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card targets">
+    <h2>3 · 编辑输出目标并提交处理</h2>
+    <div class="row">
+      <label>任务
+        <select id="targetTask" style="min-width:220px;"></select>
+      </label>
+      <label>目标综合响度 (LUFS)
+        <input type="number" id="tLufs" value="-23" step="0.5" min="-60" max="0">
+      </label>
+      <label>真峰值上限 (dBTP)
+        <input type="number" id="tTp" value="-2" step="0.5" min="-20" max="0">
+      </label>
+      <label>采样率 (Hz)
+        <select id="tRate"><option>48000</option><option>44100</option><option>32000</option><option>24000</option><option>16000</option></select>
+      </label>
+      <label>声道布局
+        <select id="tLayout"><option value="mono">mono</option><option value="stereo">stereo（mono 输入按固定 L=R 复制）</option></select>
+      </label>
+      <label>位深
+        <select id="tBits"><option>24</option><option>16（TPDF 抖动）</option><option>32</option></select>
+      </label>
+      <button id="processBtn">提交处理</button>
+      <button class="danger" id="cancelBtn">取消当前任务</button>
+    </div>
+    <p class="muted" style="font-size:12px; margin:10px 0 0;">
+      增益被限制在 ±60 dB 且永远为有限值；响度与峰值无法同时满足时，任务标记为 <b>limited / target_missed</b> 并列出仍未满足的条件。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>4 · 原音 vs 处理音 对照（真实音频预览）</h2>
+    <div id="abArea" class="muted">选择一个已完成任务后在此对照试听。</div>
+  </section>
+
+  <section class="card">
+    <h2>5 · 可复算测量表与完整处理链</h2>
+    <div id="measureArea" class="muted">尚无处理结果。</div>
+  </section>
+
+  <section class="card">
+    <h2>6 · 下载列表（仅成功导出；失败/取消不进入）与清理</h2>
+    <div class="row" style="margin-bottom:10px;">
+      <button class="secondary" id="refreshDl">刷新</button>
+    </div>
+    <table id="dlTable"><thead><tr><th>任务</th><th>作业</th><th>文件</th><th>下载</th></tr></thead><tbody></tbody></table>
+    <div class="row" style="margin-top:12px;">
+      <button class="danger" id="deleteBtn">删除选中任务及其全部文件</button>
+    </div>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
