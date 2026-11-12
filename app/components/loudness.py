@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from . import telemetry
 from .resampler import ResamplerSettings, resample
 
 # --- BS.1770-4 K-weighting coefficients, prototype rate 48 kHz -------------
@@ -76,6 +77,40 @@ def _to_weighting_rate(samples: np.ndarray, rate: int):
         return samples, None
     out, settings = resample(samples, rate, WEIGHTING_RATE)
     return out, settings
+
+
+def _oversampled_true_peak_db(samples: np.ndarray, sample_rate: int):
+    """4x-oversampled true peak in dBTP plus the resampler settings used.
+
+    Shared by measure() and true_peak_check() so both always produce the
+    identical value for the identical signal.
+    """
+    telemetry.event("true_peak_checks")
+    up, tp_settings = resample(
+        samples, sample_rate, sample_rate * TP_UPSAMPLE,
+        stopband_attenuation_db=TP_STOPBAND_DB,
+        transition_band_hz=min(TP_TRANSITION_HZ, sample_rate * TP_UPSAMPLE * 0.2),
+    )
+    return _db(float(np.max(np.abs(up)))), tp_settings
+
+
+def true_peak_check(samples: np.ndarray, sample_rate: int) -> tuple[float, float]:
+    """Oversampled true-peak check without the K-weighted loudness gating.
+
+    Returns (sample_peak_dbfs, true_peak_dbtp). Used by the optimized chain
+    for the post-gain limiter decision: the chain never consumes the
+    after-gain integrated loudness, so computing it would be wasted work,
+    but the true-peak check itself is always performed on the actual
+    processed signal — a cache hit never skips it.
+    """
+    if samples.ndim == 1:
+        samples = samples[:, None]
+    if not np.all(np.isfinite(samples)):
+        raise MeasurementError("non-finite samples cannot be measured")
+    n_frames = samples.shape[0]
+    sample_peak = float(np.max(np.abs(samples))) if n_frames else 0.0
+    true_peak_db, _ = _oversampled_true_peak_db(samples, sample_rate)
+    return _db(sample_peak), true_peak_db
 
 
 @dataclass
@@ -166,6 +201,7 @@ def measure(samples: np.ndarray, sample_rate: int, *, allow_failure: bool = Fals
     """Measure an in-memory signal. Raises SilenceError/TooShortError unless
     allow_failure is True, in which case the integrated value is returned None
     and the condition is reported via warnings instead."""
+    telemetry.event("measures")
     if samples.ndim == 1:
         samples = samples[:, None]
     if not np.all(np.isfinite(samples)):
@@ -181,13 +217,7 @@ def measure(samples: np.ndarray, sample_rate: int, *, allow_failure: bool = Fals
     rms_db = _db(rms_linear)
 
     # True peak: oversample 4x on the original (un-weighted) signal.
-    up, tp_settings = resample(
-        samples, sample_rate, sample_rate * TP_UPSAMPLE,
-        stopband_attenuation_db=TP_STOPBAND_DB,
-        transition_band_hz=min(TP_TRANSITION_HZ, sample_rate * TP_UPSAMPLE * 0.2),
-    )
-    true_peak_linear = float(np.max(np.abs(up)))
-    true_peak_db = _db(true_peak_linear)
+    true_peak_db, tp_settings = _oversampled_true_peak_db(samples, sample_rate)
 
     if sample_peak_linear <= 10.0 ** (SILENCE_PEAK_DBFS / 20.0):
         if not allow_failure:

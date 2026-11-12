@@ -12,6 +12,7 @@ import numpy as np
 
 from . import loudness, resampler
 from .channels import DUPLICATION_GAIN_DB
+from .measure_cache import DEFAULT_MAX_ENTRIES, SCHEMA_VERSION
 from .processing import (
     LIMITER_ATTACK_MS,
     LIMITER_ITERATIONS,
@@ -70,6 +71,20 @@ def runtime_provenance() -> dict:
                 "lookahead_ms": LIMITER_LOOKAHEAD_MS,
                 "max_iterations": LIMITER_ITERATIONS,
                 "oversample": loudness.TP_UPSAMPLE,
+            },
+            "measurement_cache": {
+                "schema": SCHEMA_VERSION,
+                "max_entries": DEFAULT_MAX_ENTRIES,
+                "key": "input sha256 | target sample rate | layout action | "
+                       "channel counts | settings fingerprint",
+                "boundaries": [
+                    "source measurement only; the exported file is always "
+                    "re-decoded and re-measured",
+                    "the post-gain true-peak check always runs on the "
+                    "processed signal, cache hit or not",
+                    "silence/too-short rejections are cached with warnings",
+                    "limiter engagement and output are never cached",
+                ],
             },
         },
         "executable": sys.executable,

@@ -19,6 +19,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from . import telemetry
+
 
 @dataclass(frozen=True)
 class ResamplerSettings:
@@ -86,6 +88,7 @@ def resample(samples: np.ndarray, input_rate: int, output_rate: int,
              *, stopband_attenuation_db: float = 80.0,
              transition_band_hz: float = 500.0) -> tuple[np.ndarray, ResamplerSettings]:
     """Resample (n_frames, n_channels) shaped float data from input_rate to output_rate."""
+    telemetry.event("resamples")
     if input_rate <= 0 or output_rate <= 0:
         raise ValueError("sample rates must be positive")
     g = math.gcd(input_rate, output_rate)

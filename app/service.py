@@ -20,7 +20,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .components import telemetry
 from .components.loudness import MeasurementError, measure
+from .components.measure_cache import MeasureCache
 from .components.processing import ProcessingError, Target, run_chain
 from .components.versions import runtime_provenance
 from .components.wavfile import WavFormatError, read_wav
@@ -50,6 +52,11 @@ class TaskManager:
         self._task_locks: dict[str, threading.RLock] = {}
         self._cancel: dict[str, threading.Event] = {}
         self._records: dict[str, dict] = {}
+        # Source-measurement cache shared across jobs and tasks: the key is
+        # content-addressed, so identical uploads and repeated target
+        # adjustments on the same material reuse the gating/oversampling
+        # work. Export re-measurement is never served from it.
+        self._measure_cache = MeasureCache()
         for task_id in os.listdir(self.root):
             record_path = os.path.join(self.root, task_id, "task.json")
             if os.path.isfile(record_path):
@@ -162,6 +169,20 @@ class TaskManager:
         except (WavFormatError, MeasurementError) as exc:
             self._fail(upload.task_id, f"analysis rejected: {exc}")
             raise
+        # Seed the source-measurement cache: a job whose target rate and
+        # layout match the input measures the identical working signal.
+        # Entries with warnings are cached too — a later job still rejects,
+        # it just does not re-run the gating to reach the same verdict.
+        self._measure_cache.put(
+            MeasureCache.source_key(
+                input_sha256=record["upload"]["sha256"],
+                sample_rate=audio.sample_rate,
+                layout_action="none",
+                channels_in=audio.n_channels,
+                channels_out=audio.n_channels,
+            ),
+            measurement,
+        )
         analysis = {
             "container": {
                 "sample_rate": audio.sample_rate,
@@ -223,14 +244,19 @@ class TaskManager:
         record["status"] = "processing"
         self._write_record(task_id, record)
 
+        counters = telemetry.Counters()
         try:
             self._check_cancel(task_id)
-            audio = read_wav(stored)
-            result = run_chain(audio, target, output_abs,
-                               rng=np_rng_seeded(job_id))
+            with telemetry.record(counters):
+                audio = read_wav(stored)
+                result = run_chain(audio, target, output_abs,
+                                   rng=np_rng_seeded(job_id),
+                                   cache=self._measure_cache,
+                                   input_sha256=record["upload"]["sha256"])
             self._check_cancel(task_id)
 
             job["chain"] = result.as_dict()
+            job["evidence"] = _job_evidence(counters, result)
             if result.status == "rejected":
                 job["status"] = "rejected"
                 self._remove_output(task_id, output_rel)
@@ -248,6 +274,7 @@ class TaskManager:
         except CancellationRequested:
             self._remove_output(task_id, output_rel)
             job["status"] = "cancelled"
+            job["evidence"] = {"counters": counters.as_dict(), "interrupted": True}
             job["finished_at"] = time.time()
             record["status"] = "cancelled"
             self._write_record(task_id, record)
@@ -256,6 +283,7 @@ class TaskManager:
             self._remove_output(task_id, output_rel)
             job["status"] = "failed"
             job["error"] = str(exc)
+            job["evidence"] = {"counters": counters.as_dict(), "interrupted": True}
             job["finished_at"] = time.time()
             record["status"] = "failed"
             record["error"] = str(exc)
@@ -330,3 +358,23 @@ def np_rng_seeded(seed_text: str) -> "np.random.Generator":
     digest = hashlib.sha256(seed_text.encode("utf-8")).digest()
     seed = int.from_bytes(digest[: 8], "big")
     return np.random.Generator(np.random.PCG64(seed))
+
+
+def _job_evidence(counters: "telemetry.Counters", result) -> dict:
+    """Per-job execution evidence: the cost counters next to the peaks they
+    produced. Missing measurements stay None — never defaulted."""
+    evidence = {"counters": counters.as_dict()}
+    if result.source is not None:
+        evidence["source_true_peak_dbtp"] = round(result.source.true_peak_dbtp, 4)
+        evidence["source_integrated_lufs"] = (
+            None if result.source.integrated_lufs is None
+            else round(result.source.integrated_lufs, 4)
+        )
+    if result.output is not None:
+        evidence["output_true_peak_dbtp"] = round(result.output.true_peak_dbtp, 4)
+        evidence["output_sample_peak_dbfs"] = round(result.output.sample_peak_dbfs, 4)
+        evidence["output_integrated_lufs"] = (
+            None if result.output.integrated_lufs is None
+            else round(result.output.integrated_lufs, 4)
+        )
+    return evidence

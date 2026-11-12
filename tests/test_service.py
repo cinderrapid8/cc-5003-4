@@ -94,7 +94,7 @@ def test_cancellation_cleans_partial_output(store, monkeypatch):
     called = {"n": 0}
     real_run = __import__("app.service", fromlist=["run_chain"]).run_chain
 
-    def cancelling_chain(audio, target, path, rng=None):
+    def cancelling_chain(audio, target, path, rng=None, **kwargs):
         called["n"] += 1
         raise CancellationRequested(upload.task_id)
 
@@ -109,6 +109,37 @@ def test_cancellation_cleans_partial_output(store, monkeypatch):
     assert store.downloadable() == []
     exports = os.path.join(store.root, upload.task_id, "exports")
     assert not os.listdir(exports)
+
+
+def test_repeat_jobs_reuse_source_measurement_with_evidence(store):
+    sig, rate = calibrated_speech_like(seconds=2)
+    upload = store.create_task("g.wav", _wav_bytes(sig, rate))
+    store.analyze(upload)
+    job1 = store.process(upload.task_id, {
+        "integrated_lufs": -23, "true_peak_dbtp": -2,
+        "sample_rate": 48000, "layout": "mono", "bit_depth": 24,
+    })
+    job2 = store.process(upload.task_id, {
+        "integrated_lufs": -24, "true_peak_dbtp": -2,
+        "sample_rate": 48000, "layout": "mono", "bit_depth": 24,
+    })
+    assert job1["status"] == job2["status"] == "succeeded"
+    ev1, ev2 = job1["evidence"], job2["evidence"]
+    # Analysis seeded the cache: both jobs reuse the source measurement.
+    assert ev1["counters"]["cache_hits"] >= 1
+    assert ev2["counters"]["cache_hits"] >= 1
+    # Only the export re-measurement remains as a full measure per job.
+    assert ev1["counters"]["measures"] == 1
+    assert ev2["counters"]["measures"] == 1
+    # Decode counts are evidence, not savings: input + export every job.
+    assert ev1["counters"]["decodes"] == 2
+    assert ev2["counters"]["decodes"] == 2
+    # The true-peak check ran on every job, cache hit or not.
+    assert ev1["counters"]["true_peak_checks"] >= 1
+    assert ev2["counters"]["true_peak_checks"] >= 1
+    # Same source statistics, different targets -> different exports.
+    assert ev1["source_integrated_lufs"] == ev2["source_integrated_lufs"]
+    assert ev1["output_integrated_lufs"] != ev2["output_integrated_lufs"]
 
 
 def test_delete_task_removes_everything(store):

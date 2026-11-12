@@ -15,6 +15,20 @@ Stages, in fixed order:
 When the loudness target and true-peak ceiling cannot both be reached, the
 chain still emits a bounded signal and reports `limited` / `target_missed`
 with the remaining gap. An infinite or NaN gain is never produced or applied.
+
+Optimized computation order (cache=... passed, see measure_cache):
+  * Stage 4 is served from the content-addressed source-measurement cache
+    when the same input was already measured under the same settings and
+    channel interpretation; the gating/oversampling work is skipped only
+    then. The stage order is unchanged.
+  * Stage 6 computes the oversampled true-peak check on the gained signal
+    via loudness.true_peak_check instead of a full measure(): the chain
+    only ever consumes the after-gain true peak here, never the after-gain
+    integrated loudness, so the K-weighted gating for it is dropped. The
+    true-peak check itself always runs — a cache hit never skips it.
+  * Stage 8 is identical in both orders: the exported file is always
+    re-decoded and re-measured. Cached or derived numbers are never used
+    as the post-processing re-measurement.
 """
 from __future__ import annotations
 
@@ -24,6 +38,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from . import telemetry
 from .channels import LayoutDecision, apply_layout, channel_balance
 from .loudness import (
     TP_UPSAMPLE,
@@ -31,7 +46,9 @@ from .loudness import (
     SilenceError,
     TooShortError,
     measure,
+    true_peak_check,
 )
+from .measure_cache import MeasureCache
 from .resampler import ResamplerSettings, resample
 from .wavfile import AudioFile, write_wav
 
@@ -177,6 +194,7 @@ def apply_limiter(samples: np.ndarray, rate: int, ceiling_dbtp: float
     total_reduction = 0.0
     current = samples.copy()
     up_settings: ResamplerSettings | None = None
+    telemetry.event("limiter_runs")
 
     for iterations in range(1, LIMITER_ITERATIONS + 1):
         up, up_settings = resample(
@@ -185,6 +203,7 @@ def apply_limiter(samples: np.ndarray, rate: int, ceiling_dbtp: float
             transition_band_hz=min(4000.0, rate * 0.4),
         )
         level = np.max(np.abs(up), axis=1)
+        telemetry.event("true_peak_checks")
         if float(np.max(level)) <= threshold * (1.0 + 1e-9):
             break
         desired = np.ones_like(level)
@@ -205,6 +224,7 @@ def apply_limiter(samples: np.ndarray, rate: int, ceiling_dbtp: float
             transition_band_hz=min(4000.0, rate * 0.4),
         )
         verify_peak = float(np.max(np.abs(verify)))
+        telemetry.event("true_peak_checks")
         if verify_peak <= threshold * (1.0 + 1e-9):
             current = decimated
             break
@@ -268,7 +288,17 @@ class ChainResult:
 
 
 def run_chain(audio: AudioFile, target: Target, output_path: str,
-              rng: np.random.Generator | None = None) -> ChainResult:
+              rng: np.random.Generator | None = None, *,
+              cache: MeasureCache | None = None,
+              input_sha256: str | None = None) -> ChainResult:
+    """Run the production chain.
+
+    With ``cache=None`` the original computation order runs: every stage
+    measures fresh. With a MeasureCache and the input digest, stage 4 reuses
+    a cached source measurement when the key (input digest, target rate,
+    channel interpretation, settings fingerprint) matches, and stage 6 uses
+    the true-peak-only check; stage 8 re-measurement is unchanged.
+    """
     rng = rng or np.random.default_rng(0xA17C)
     samples = audio.samples.astype(np.float64, copy=True)
     balance = channel_balance(samples)
@@ -280,7 +310,25 @@ def run_chain(audio: AudioFile, target: Target, output_path: str,
     samples, rate_settings = resample(samples, audio.sample_rate, target.sample_rate)
 
     # Stage 4: source measurement on the rate/layout-adjusted working signal.
-    source = measure(samples, target.sample_rate, allow_failure=True)
+    source: Measurement | None = None
+    if cache is not None:
+        if not input_sha256:
+            raise ProcessingError(
+                "input_sha256 is required when a measurement cache is used"
+            )
+        key = cache.source_key(
+            input_sha256=input_sha256,
+            sample_rate=target.sample_rate,
+            layout_action=layout.action,
+            channels_in=audio.n_channels,
+            channels_out=samples.shape[1],
+        )
+        source = cache.get(key)
+        if source is None:
+            source = measure(samples, target.sample_rate, allow_failure=True)
+            cache.put(key, source)
+    else:
+        source = measure(samples, target.sample_rate, allow_failure=True)
     unmet: list[str] = []
 
     if source.warnings:
@@ -308,9 +356,16 @@ def run_chain(audio: AudioFile, target: Target, output_path: str,
     processed = samples * gain_linear
 
     # Stage 6: true-peak limiter when the ceiling is not met by gain alone.
+    # The optimized order uses the true-peak-only check on the gained signal;
+    # the original order runs a full measurement. Both evaluate the same
+    # oversampled peak on the actual processed samples.
     limiter: LimiterTrace | None = None
-    after_gain = measure(processed, target.sample_rate, allow_failure=True)
-    if after_gain.true_peak_dbtp > target.true_peak_dbtp + 0.001:
+    if cache is not None:
+        _, after_gain_tp = true_peak_check(processed, target.sample_rate)
+    else:
+        after_gain = measure(processed, target.sample_rate, allow_failure=True)
+        after_gain_tp = after_gain.true_peak_dbtp
+    if after_gain_tp > target.true_peak_dbtp + 0.001:
         processed, limiter, _ = apply_limiter(
             processed, target.sample_rate, target.true_peak_dbtp
         )

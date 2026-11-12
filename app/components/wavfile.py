@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from . import telemetry
+
 
 class WavFormatError(ValueError):
     """Raised when a file is not a parseable supported WAV stream."""
@@ -62,6 +64,7 @@ def _read_fmt_chunk(data: bytes, offset: int, size: int):
 
 
 def read_wav(path: str) -> AudioFile:
+    telemetry.event("decodes")
     with open(path, "rb") as fh:
         data = fh.read()
     if len(data) < 12 or data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
